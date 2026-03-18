@@ -1,4 +1,10 @@
-"""Backend for Gemini API using OpenAI-compatible interface."""
+"""Backend for Gemini API using OpenAI-compatible interface.
+
+Supports two authentication modes:
+- GEMINI_API_KEY: standard Gemini Developer API
+- GOOGLE_APPLICATION_CREDENTIALS: Vertex AI service account key (key.json),
+  with optional GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION overrides.
+"""
 
 import json
 import logging
@@ -24,12 +30,43 @@ GEMINI_TIMEOUT_EXCEPTIONS = (
 @once
 def _setup_gemini_client():
     global _client
-    gemini_base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
 
-    # Check for Gemini API key in environment variables
-    api_key = os.getenv("GEMINI_API_KEY")
+    gac = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    if gac:
+        import httpx
+        import google.oauth2.service_account
+        import google.auth.transport.requests
 
-    _client = openai.OpenAI(api_key=api_key, base_url=gemini_base_url, max_retries=0)
+        _VERTEX_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
+        credentials = google.oauth2.service_account.Credentials.from_service_account_file(
+            gac, scopes=_VERTEX_SCOPES
+        )
+
+        project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or credentials.project_id
+        location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
+        base_url = (
+            f"https://{location}-aiplatform.googleapis.com/v1beta1/"
+            f"projects/{project_id}/locations/{location}/endpoints/openapi/"
+        )
+        logger.info(f"Using Vertex AI endpoint: {base_url}")
+
+        class _VertexAuth(httpx.Auth):
+            def auth_flow(self, request):
+                if not credentials.valid:
+                    credentials.refresh(google.auth.transport.requests.Request())
+                request.headers["Authorization"] = f"Bearer {credentials.token}"
+                yield request
+
+        _client = openai.OpenAI(
+            api_key="unused",  # required by SDK but overridden by Authorization header
+            base_url=base_url,
+            http_client=httpx.Client(auth=_VertexAuth()),
+            max_retries=0,
+        )
+    else:
+        api_key = os.getenv("GEMINI_API_KEY")
+        gemini_base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        _client = openai.OpenAI(api_key=api_key, base_url=gemini_base_url, max_retries=0)
 
 
 def query(
