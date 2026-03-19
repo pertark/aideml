@@ -32,17 +32,24 @@ def _setup_gemini_client():
     global _client
 
     gac = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    api_key = os.getenv("GEMINI_API_KEY")
+
     if gac:
         import httpx
-        import google.oauth2.service_account
+        import google.auth
         import google.auth.transport.requests
 
         _VERTEX_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
-        credentials = google.oauth2.service_account.Credentials.from_service_account_file(
-            gac, scopes=_VERTEX_SCOPES
-        )
 
-        project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or credentials.project_id
+        credentials, detected_project_id = google.auth.default(scopes=_VERTEX_SCOPES)
+
+        project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or detected_project_id
+        if not project_id:
+            raise RuntimeError(
+                "Could not determine Google Cloud project ID. "
+                "Set GOOGLE_CLOUD_PROJECT explicitly."
+            )
+
         location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
         base_url = (
             f"https://{location}-aiplatform.googleapis.com/v1beta1/"
@@ -58,16 +65,25 @@ def _setup_gemini_client():
                 yield request
 
         _client = openai.OpenAI(
-            api_key="unused",  # required by SDK but overridden by Authorization header
+            api_key="unused",
             base_url=base_url,
             http_client=httpx.Client(auth=_VertexAuth()),
             max_retries=0,
         )
-    else:
-        api_key = os.getenv("GEMINI_API_KEY")
-        gemini_base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
-        _client = openai.OpenAI(api_key=api_key, base_url=gemini_base_url, max_retries=0)
 
+    else:
+        if not api_key:
+            raise RuntimeError(
+                "Set either GOOGLE_APPLICATION_CREDENTIALS for Vertex AI "
+                "or GEMINI_API_KEY for Gemini Developer API."
+            )
+
+        gemini_base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
+        _client = openai.OpenAI(
+            api_key=api_key,
+            base_url=gemini_base_url,
+            max_retries=0,
+        )
 
 def query(
     system_message: str | None,
