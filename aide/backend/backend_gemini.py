@@ -1,197 +1,155 @@
-"""Backend for Gemini API using OpenAI-compatible interface.
+"""Backend for Google Gemini using the google-genai SDK.
 
-Supports two authentication modes:
-- GEMINI_API_KEY: standard Gemini Developer API
-- GOOGLE_APPLICATION_CREDENTIALS: Vertex AI service account key (key.json),
-  with optional GOOGLE_CLOUD_PROJECT and GOOGLE_CLOUD_LOCATION overrides.
+Authentication:
+- Set GOOGLE_GENAI_USE_VERTEXAI=True to use Vertex AI (picks up
+  GOOGLE_APPLICATION_CREDENTIALS automatically via google-auth ADC).
+- Otherwise uses GEMINI_API_KEY for the Gemini Developer API.
 """
 
-import json
 import logging
-import os
 import time
 
-from .utils import FunctionSpec, OutputType, opt_messages_to_list, backoff_create
-from funcy import notnone, once, select_values
-import openai
+import backoff
+from funcy import once
+from google import genai
+from google.genai import types
+
+from .utils import FunctionSpec, OutputType, PromptType, compile_prompt_to_md
 
 logger = logging.getLogger("aide")
 
-_client: openai.OpenAI = None  # type: ignore
+_client: genai.Client = None  # type: ignore
 
-GEMINI_TIMEOUT_EXCEPTIONS = (
-    openai.RateLimitError,
-    openai.APIConnectionError,
-    openai.APITimeoutError,
-    openai.InternalServerError,
-)
+try:
+    from google.api_core.exceptions import (
+        DeadlineExceeded,
+        InternalServerError as _GoogInternalServerError,
+        ResourceExhausted,
+        ServiceUnavailable,
+    )
+
+    _RETRY_EXCEPTIONS = (
+        ResourceExhausted,
+        ServiceUnavailable,
+        DeadlineExceeded,
+        _GoogInternalServerError,
+    )
+except ImportError:
+    _RETRY_EXCEPTIONS = (Exception,)
 
 
 @once
 def _setup_gemini_client():
     global _client
+    _client = genai.Client()
 
-    gac = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-    api_key = os.getenv("GEMINI_API_KEY")
 
-    if gac:
-        import httpx
-        import google.auth
-        import google.auth.transport.requests
+def _to_str(msg: PromptType) -> str:
+    """Ensure a prompt (str, dict, or list) is a plain string."""
+    if isinstance(msg, str):
+        return msg
+    return compile_prompt_to_md(msg)
 
-        _VERTEX_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
 
-        credentials, detected_project_id = google.auth.default(scopes=_VERTEX_SCOPES)
-
-        project_id = os.getenv("GOOGLE_CLOUD_PROJECT") or detected_project_id
-        if not project_id:
-            raise RuntimeError(
-                "Could not determine Google Cloud project ID. "
-                "Set GOOGLE_CLOUD_PROJECT explicitly."
+def _func_spec_to_tool(func_spec: FunctionSpec) -> types.Tool:
+    return types.Tool(
+        function_declarations=[
+            types.FunctionDeclaration(
+                name=func_spec.name,
+                description=func_spec.description,
+                parameters=func_spec.json_schema,
             )
+        ]
+    )
 
-        location = os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1")
-        base_url = (
-            f"https://{location}-aiplatform.googleapis.com/v1beta1/"
-            f"projects/{project_id}/locations/{location}/endpoints/openapi/"
-        )
-        logger.info(f"Using Vertex AI endpoint: {base_url}")
-
-        class _VertexAuth(httpx.Auth):
-            def auth_flow(self, request):
-                if not credentials.valid:
-                    credentials.refresh(google.auth.transport.requests.Request())
-                request.headers["Authorization"] = f"Bearer {credentials.token}"
-                yield request
-
-        _client = openai.OpenAI(
-            api_key="unused",
-            base_url=base_url,
-            http_client=httpx.Client(auth=_VertexAuth()),
-            max_retries=0,
-        )
-
-    else:
-        if not api_key:
-            raise RuntimeError(
-                "Set either GOOGLE_APPLICATION_CREDENTIALS for Vertex AI "
-                "or GEMINI_API_KEY for Gemini Developer API."
-            )
-
-        gemini_base_url = "https://generativelanguage.googleapis.com/v1beta/openai/"
-        _client = openai.OpenAI(
-            api_key=api_key,
-            base_url=gemini_base_url,
-            max_retries=0,
-        )
 
 def query(
-    system_message: str | None,
-    user_message: str | None,
+    system_message: PromptType | None,
+    user_message: PromptType | None,
     func_spec: FunctionSpec | None = None,
     **model_kwargs,
 ) -> tuple[OutputType, float, int, int, dict]:
-    """
-    Query the Gemini API via OpenAI-compatible interface, optionally with function calling.
-    If the model doesn't support function calling, gracefully degrade to text generation.
-    """
     _setup_gemini_client()
-    filtered_kwargs: dict = select_values(notnone, model_kwargs)
 
-    # Gemini doesn't allow not having user messages
-    # if we only have system msg -> use it as user msg
+    model = model_kwargs.pop("model")
+    temperature = model_kwargs.pop("temperature", None)
+    max_tokens = model_kwargs.pop("max_tokens", None)
+
+    # Gemini requires non-empty user content; if only a system message was
+    # provided, promote it to the user turn (matches prior behaviour).
     if system_message is not None and user_message is None:
-        system_message, user_message = user_message, system_message
-
-    # Convert system/user messages to the format required by the client
-    messages = opt_messages_to_list(system_message, user_message)
-
-    # If function calling is requested, attach the function spec
-    if func_spec is not None:
-        filtered_kwargs["tools"] = [func_spec.as_openai_tool_dict]
-        filtered_kwargs["tool_choice"] = func_spec.openai_tool_choice_dict
-
-    logger.info(f"Gemini API request: system={system_message}, user={user_message}")
-
-    completion = None
-    t0 = time.time()
-
-    # Attempt the API call
-    try:
-        completion = backoff_create(
-            _client.chat.completions.create,
-            GEMINI_TIMEOUT_EXCEPTIONS,
-            messages=messages,
-            **filtered_kwargs,
-        )
-    except openai.BadRequestError as e:
-        # Check whether the error indicates that function calling is not supported
-        if "function calling" in str(e).lower() or "tools" in str(e).lower():
-            logger.warning(
-                "Function calling was attempted but is not supported by this model. "
-                "Falling back to plain text generation."
-            )
-            # Remove function-calling parameters and retry
-            filtered_kwargs.pop("tools", None)
-            filtered_kwargs.pop("tool_choice", None)
-
-            # Retry without function calling
-            completion = backoff_create(
-                _client.chat.completions.create,
-                GEMINI_TIMEOUT_EXCEPTIONS,
-                messages=messages,
-                **filtered_kwargs,
-            )
-        else:
-            # If it's some other error, re-raise
-            raise
-
-    req_time = time.time() - t0
-    choice = completion.choices[0]
-
-    # Decide how to parse the response
-    if func_spec is None or "tools" not in filtered_kwargs:
-        # No function calling was ultimately used
-        output = choice.message.content
+        contents = _to_str(system_message)
+        system_instruction = None
     else:
-        # Attempt to extract tool calls
-        tool_calls = getattr(choice.message, "tool_calls", None)
-        if not tool_calls:
-            logger.warning(
-                "No function call was used despite function spec. Fallback to text.\n"
-                f"Message content: {choice.message.content}"
-            )
-            output = choice.message.content
-        else:
-            first_call = tool_calls[0]
-            # Optional: verify that the function name matches
-            if first_call.function.name != func_spec.name:
-                logger.warning(
-                    f"Function name mismatch: expected {func_spec.name}, "
-                    f"got {first_call.function.name}. Fallback to text."
-                )
-                output = choice.message.content
-            else:
-                try:
-                    output = json.loads(first_call.function.arguments)
-                except json.JSONDecodeError as ex:
-                    logger.error(
-                        "Error decoding function arguments:\n"
-                        f"{first_call.function.arguments}"
-                    )
-                    raise ex
+        contents = _to_str(user_message) if user_message is not None else ""
+        system_instruction = _to_str(system_message) if system_message is not None else None
 
-    in_tokens = completion.usage.prompt_tokens
-    out_tokens = completion.usage.completion_tokens
+    config_kwargs: dict = {}
+    if system_instruction:
+        config_kwargs["system_instruction"] = system_instruction
+    if temperature is not None:
+        config_kwargs["temperature"] = temperature
+    if max_tokens is not None:
+        config_kwargs["max_output_tokens"] = max_tokens
+
+    if func_spec is not None:
+        config_kwargs["tools"] = [_func_spec_to_tool(func_spec)]
+        config_kwargs["tool_config"] = types.ToolConfig(
+            function_calling_config=types.FunctionCallingConfig(
+                mode=types.FunctionCallingConfigMode.ANY,
+                allowed_function_names=[func_spec.name],
+            )
+        )
+
+    config = types.GenerateContentConfig(**config_kwargs)
+
+    @backoff.on_exception(backoff.expo, _RETRY_EXCEPTIONS, max_value=60, factor=1.5)
+    def _call():
+        return _client.models.generate_content(
+            model=model,
+            contents=contents,
+            config=config,
+        )
+
+    logger.info(f"Gemini API request: model={model}, system={system_message}, user={user_message}")
+
+    t0 = time.time()
+    response = _call()
+    req_time = time.time() - t0
+
+    candidate = response.candidates[0]
+    parts = candidate.content.parts if candidate.content else []
+    first_part = parts[0] if parts else None
+
+    if func_spec is not None and first_part is not None and first_part.function_call:
+        fc = first_part.function_call
+        if fc.name != func_spec.name:
+            logger.warning(
+                f"Function name mismatch: expected {func_spec.name}, "
+                f"got {fc.name}. Falling back to text."
+            )
+            output = response.text
+        else:
+            output = dict(fc.args)
+    else:
+        if func_spec is not None:
+            logger.warning(
+                "No function call in response despite func_spec. "
+                f"Falling back to text.\nContent: {response.text}"
+            )
+        output = response.text
+
+    in_tokens = response.usage_metadata.prompt_token_count or 0
+    out_tokens = response.usage_metadata.candidates_token_count or 0
 
     info = {
-        "system_fingerprint": getattr(completion, "system_fingerprint", None),
-        "model": completion.model,
-        "created": getattr(completion, "created", None),
+        "model": model,
+        "finish_reason": str(candidate.finish_reason),
     }
 
     logger.info(
-        f"Gemini API call completed - {completion.model} - {req_time:.2f}s - {in_tokens + out_tokens} tokens (in: {in_tokens}, out: {out_tokens})"
+        f"Gemini API call completed - {model} - {req_time:.2f}s - "
+        f"{in_tokens + out_tokens} tokens (in: {in_tokens}, out: {out_tokens})"
     )
     logger.info(f"Gemini API response: {output}")
 
